@@ -112,8 +112,7 @@ public class ManagerApiGrpcTest {
                     snapshotMetadataStore,
                     replicaRestoreService,
                     fieldRedactionMetadataStore,
-                    replicaMetadataStore,
-                    managerConfig))
+                    replicaMetadataStore))
             .build()
             .start());
     ManagedChannel channel =

@@ -3,7 +3,6 @@ package com.slack.astra.server;
 import static com.slack.astra.metadata.dataset.DatasetMetadataSerializer.toDatasetMetadataProto;
 import static com.slack.astra.metadata.fieldredaction.FieldRedactionMetadataSerializer.toRedactedFieldMetadataProto;
 import static java.lang.Thread.sleep;
-import static java.util.stream.Collectors.groupingBy;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -17,11 +16,9 @@ import com.slack.astra.metadata.dataset.DatasetPartitionMetadata;
 import com.slack.astra.metadata.fieldredaction.FieldRedactionMetadata;
 import com.slack.astra.metadata.fieldredaction.FieldRedactionMetadataSerializer;
 import com.slack.astra.metadata.fieldredaction.FieldRedactionMetadataStore;
-import com.slack.astra.metadata.replica.ReplicaMetadata;
 import com.slack.astra.metadata.replica.ReplicaMetadataStore;
 import com.slack.astra.metadata.snapshot.SnapshotMetadata;
 import com.slack.astra.metadata.snapshot.SnapshotMetadataStore;
-import com.slack.astra.proto.config.AstraConfigs;
 import com.slack.astra.proto.manager_api.ManagerApi;
 import com.slack.astra.proto.manager_api.ManagerApiServiceGrpc;
 import com.slack.astra.proto.metadata.Metadata;
@@ -35,7 +32,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import javax.naming.SizeLimitExceededException;
 import org.slf4j.Logger;
@@ -54,21 +50,18 @@ public class ManagerApiGrpc extends ManagerApiServiceGrpc.ManagerApiServiceImplB
   private final ReplicaRestoreService replicaRestoreService;
   private final FieldRedactionMetadataStore fieldRedactionMetadataStore;
   private final ReplicaMetadataStore replicaMetadataStore;
-  private final AstraConfigs.ManagerConfig managerConfig;
 
   public ManagerApiGrpc(
       DatasetMetadataStore datasetMetadataStore,
       SnapshotMetadataStore snapshotMetadataStore,
       ReplicaRestoreService replicaRestoreService,
       FieldRedactionMetadataStore fieldRedactionMetadataStore,
-      ReplicaMetadataStore replicaMetadataStore,
-      AstraConfigs.ManagerConfig managerConfig) {
+      ReplicaMetadataStore replicaMetadataStore) {
     this.datasetMetadataStore = datasetMetadataStore;
     this.snapshotMetadataStore = snapshotMetadataStore;
     this.replicaRestoreService = replicaRestoreService;
     this.fieldRedactionMetadataStore = fieldRedactionMetadataStore;
     this.replicaMetadataStore = replicaMetadataStore;
-    this.managerConfig = managerConfig;
   }
 
   /** Initializes a new dataset in the metadata store with no initial allocated capacity */
@@ -506,14 +499,15 @@ public class ManagerApiGrpc extends ManagerApiServiceGrpc.ManagerApiServiceImplB
       StreamObserver<ManagerApi.ResetAllReplicaLifespansResponse> responseObserver) {
     try {
       replicaMetadataStore.listSync().stream()
-          .forEach(replica -> {
-              try {
-                 sleep(5);
-                 replicaMetadataStore.deleteSync(replica);
-              } catch (InterruptedException e) {
-//                  throw new RuntimeException(e);
-              }
-          });
+          .forEach(
+              replica -> {
+                try {
+                  sleep(5);
+                  replicaMetadataStore.deleteSync(replica);
+                } catch (InterruptedException e) {
+                  //                  throw new RuntimeException(e);
+                }
+              });
       responseObserver.onNext(
           ManagerApi.ResetAllReplicaLifespansResponse.newBuilder().setStatus("success").build());
       responseObserver.onCompleted();
