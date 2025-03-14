@@ -2,6 +2,8 @@ package com.slack.astra.server;
 
 import static com.slack.astra.metadata.dataset.DatasetMetadataSerializer.toDatasetMetadataProto;
 import static com.slack.astra.metadata.fieldredaction.FieldRedactionMetadataSerializer.toRedactedFieldMetadataProto;
+import static java.lang.Thread.sleep;
+import static java.util.stream.Collectors.groupingBy;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -33,6 +35,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import javax.naming.SizeLimitExceededException;
 import org.slf4j.Logger;
@@ -503,24 +506,14 @@ public class ManagerApiGrpc extends ManagerApiServiceGrpc.ManagerApiServiceImplB
       StreamObserver<ManagerApi.ResetAllReplicaLifespansResponse> responseObserver) {
     try {
       replicaMetadataStore.listSync().stream()
-          .map(
-              replica -> {
-                long newExpiration =
-                    replica.createdTimeEpochMs
-                        + (managerConfig.getReplicaCreationServiceConfig().getReplicaLifespanMins()
-                            * 60
-                            * 1000);
-                ReplicaMetadata replicaMetadataNew =
-                    new ReplicaMetadata(
-                        replica.name,
-                        replica.snapshotId,
-                        replica.replicaSet,
-                        replica.createdTimeEpochMs,
-                        newExpiration,
-                        replica.isRestored);
-                return replicaMetadataNew;
-              })
-          .forEach(replicaMetadataStore::updateSync);
+          .forEach(replica -> {
+              try {
+                 sleep(5);
+                 replicaMetadataStore.deleteSync(replica);
+              } catch (InterruptedException e) {
+//                  throw new RuntimeException(e);
+              }
+          });
       responseObserver.onNext(
           ManagerApi.ResetAllReplicaLifespansResponse.newBuilder().setStatus("success").build());
       responseObserver.onCompleted();
