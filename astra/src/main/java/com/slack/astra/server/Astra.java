@@ -321,7 +321,9 @@ public class Astra {
                       datasetMetadataStore,
                       snapshotMetadataStore,
                       replicaRestoreService,
-                      fieldRedactionMetadataStore))
+                      fieldRedactionMetadataStore,
+                      replicaMetadataStore,
+                      managerConfig))
               .build();
       services.add(armeriaService);
 

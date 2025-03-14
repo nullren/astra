@@ -15,8 +15,11 @@ import com.slack.astra.metadata.dataset.DatasetPartitionMetadata;
 import com.slack.astra.metadata.fieldredaction.FieldRedactionMetadata;
 import com.slack.astra.metadata.fieldredaction.FieldRedactionMetadataSerializer;
 import com.slack.astra.metadata.fieldredaction.FieldRedactionMetadataStore;
+import com.slack.astra.metadata.replica.ReplicaMetadata;
+import com.slack.astra.metadata.replica.ReplicaMetadataStore;
 import com.slack.astra.metadata.snapshot.SnapshotMetadata;
 import com.slack.astra.metadata.snapshot.SnapshotMetadataStore;
+import com.slack.astra.proto.config.AstraConfigs;
 import com.slack.astra.proto.manager_api.ManagerApi;
 import com.slack.astra.proto.manager_api.ManagerApiServiceGrpc;
 import com.slack.astra.proto.metadata.Metadata;
@@ -47,16 +50,22 @@ public class ManagerApiGrpc extends ManagerApiServiceGrpc.ManagerApiServiceImplB
   public static final long MAX_TIME = Long.MAX_VALUE;
   private final ReplicaRestoreService replicaRestoreService;
   private final FieldRedactionMetadataStore fieldRedactionMetadataStore;
+  private final ReplicaMetadataStore replicaMetadataStore;
+  private final AstraConfigs.ManagerConfig managerConfig;
 
   public ManagerApiGrpc(
       DatasetMetadataStore datasetMetadataStore,
       SnapshotMetadataStore snapshotMetadataStore,
       ReplicaRestoreService replicaRestoreService,
-      FieldRedactionMetadataStore fieldRedactionMetadataStore) {
+      FieldRedactionMetadataStore fieldRedactionMetadataStore,
+      ReplicaMetadataStore replicaMetadataStore,
+      AstraConfigs.ManagerConfig managerConfig) {
     this.datasetMetadataStore = datasetMetadataStore;
     this.snapshotMetadataStore = snapshotMetadataStore;
     this.replicaRestoreService = replicaRestoreService;
     this.fieldRedactionMetadataStore = fieldRedactionMetadataStore;
+    this.replicaMetadataStore = replicaMetadataStore;
+    this.managerConfig = managerConfig;
   }
 
   /** Initializes a new dataset in the metadata store with no initial allocated capacity */
@@ -483,6 +492,40 @@ public class ManagerApiGrpc extends ManagerApiServiceGrpc.ManagerApiServiceImplB
       responseObserver.onCompleted();
     } catch (Exception e) {
       LOG.error("Error getting field redactions", e);
+      responseObserver.onError(Status.UNKNOWN.withDescription(e.getMessage()).asException());
+    }
+  }
+
+  /** Resets expiration date on all replicas to the current configured value */
+  @Override
+  public void resetAllReplicaLifespans(
+      ManagerApi.ResetAllReplicaLifespansRequest request,
+      StreamObserver<ManagerApi.ResetAllReplicaLifespansResponse> responseObserver) {
+    try {
+      replicaMetadataStore.listSync().stream()
+          .map(
+              replica -> {
+                long newExpiration =
+                    replica.createdTimeEpochMs
+                        + (managerConfig.getReplicaCreationServiceConfig().getReplicaLifespanMins()
+                            * 60
+                            * 1000);
+                ReplicaMetadata replicaMetadataNew =
+                    new ReplicaMetadata(
+                        replica.name,
+                        replica.snapshotId,
+                        replica.replicaSet,
+                        replica.createdTimeEpochMs,
+                        newExpiration,
+                        replica.isRestored);
+                return replicaMetadataNew;
+              })
+          .forEach(replicaMetadataStore::updateSync);
+      responseObserver.onNext(
+          ManagerApi.ResetAllReplicaLifespansResponse.newBuilder().setStatus("success").build());
+      responseObserver.onCompleted();
+    } catch (Exception e) {
+      LOG.error("Error resetting replica expirations", e);
       responseObserver.onError(Status.UNKNOWN.withDescription(e.getMessage()).asException());
     }
   }
