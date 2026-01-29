@@ -70,6 +70,12 @@ public class EtcdMetadataStore<T extends AstraMetadata> implements Closeable {
   /** TTL in milliseconds for ephemeral nodes. */
   private final long ephemeralTtlMs;
 
+  /**
+   * When true, this store's cache is managed by an external watcher (e.g., from
+   * EtcdPartitioningMetadataStore). No internal watch is created, reducing etcd connections.
+   */
+  private final boolean useExternalWatch;
+
   private static final Logger LOG = LoggerFactory.getLogger(EtcdMetadataStore.class);
 
   protected final String storeFolder;
@@ -129,7 +135,8 @@ public class EtcdMetadataStore<T extends AstraMetadata> implements Closeable {
         meterRegistry,
         serializer,
         EtcdCreateMode.PERSISTENT,
-        etcClient);
+        etcClient,
+        false);
   }
 
   /** Constructor that accepts an external etcd client instance with specified create mode. */
@@ -141,6 +148,33 @@ public class EtcdMetadataStore<T extends AstraMetadata> implements Closeable {
       MetadataSerializer<T> serializer,
       EtcdCreateMode createMode,
       Client etcdClient) {
+    this(
+        storeFolder, config, shouldCache, meterRegistry, serializer, createMode, etcdClient, false);
+  }
+
+  /**
+   * Constructor that accepts an external etcd client instance with specified create mode and
+   * external watch option.
+   *
+   * @param storeFolder The folder path in etcd for this store
+   * @param config The etcd configuration
+   * @param shouldCache Whether to maintain an in-memory cache
+   * @param meterRegistry Metrics registry
+   * @param serializer Serializer for the metadata type
+   * @param createMode Whether to create persistent or ephemeral nodes
+   * @param etcdClient The etcd client instance
+   * @param useExternalWatch When true, cache is managed by an external watcher (no internal watch
+   *     created). This is used by EtcdPartitioningMetadataStore to consolidate watches.
+   */
+  public EtcdMetadataStore(
+      String storeFolder,
+      EtcdConfig config,
+      boolean shouldCache,
+      MeterRegistry meterRegistry,
+      MetadataSerializer<T> serializer,
+      EtcdCreateMode createMode,
+      Client etcdClient,
+      boolean useExternalWatch) {
     this.storeFolder = storeFolder;
     this.namespace = config.getNamespace();
     this.meterRegistry = meterRegistry;
@@ -150,6 +184,7 @@ public class EtcdMetadataStore<T extends AstraMetadata> implements Closeable {
     this.createMode = createMode;
     this.ephemeralTtlMs = config.getEphemeralNodeTtlMs();
     this.etcdOperationTimeoutMs = config.getOperationsTimeoutMs();
+    this.useExternalWatch = useExternalWatch;
 
     // Store retry configuration for watch operations
     this.etcdOperationsMaxRetries = Math.max(0, config.getOperationsMaxRetries());
@@ -215,14 +250,24 @@ public class EtcdMetadataStore<T extends AstraMetadata> implements Closeable {
     if (shouldCache) {
       LOG.info("Cache enabled for etcd store: {}", storeFolder);
 
-      // Create and register a default listener to keep the cache in sync with etcd changes
-      // This ensures that even without explicit listeners, the cache stays updated across JVMs
-      addListener(node -> LOG.trace("Default watcher updated cache for node: {}", node.getName()));
+      if (useExternalWatch) {
+        // External watch mode: cache is managed by parent (e.g., EtcdPartitioningMetadataStore)
+        // Skip creating internal watcher - parent will call updateCacheFromExternalWatch()
+        LOG.info(
+            "Using external watch mode for store: {} - no internal watcher created", storeFolder);
+        // Still populate initial cache synchronously
+        populateInitialCache();
+      } else {
+        // Standard mode: create internal watcher to keep cache in sync
+        // This ensures that even without explicit listeners, the cache stays updated across JVMs
+        addListener(
+            node -> LOG.trace("Default watcher updated cache for node: {}", node.getName()));
 
-      // Populate cache synchronously during initialization
-      populateInitialCache();
+        // Populate cache synchronously during initialization
+        populateInitialCache();
 
-      LOG.info("Default cache watcher started for store: {}", storeFolder);
+        LOG.info("Default cache watcher started for store: {}", storeFolder);
+      }
     }
   }
 
@@ -1021,6 +1066,56 @@ public class EtcdMetadataStore<T extends AstraMetadata> implements Closeable {
     } else {
       LOG.warn("Attempted to remove unknown listener");
     }
+  }
+
+  /**
+   * Updates the cache from an external watch event. This method is called by
+   * EtcdPartitioningMetadataStore when it receives watch events and needs to route them to the
+   * appropriate partition's cache.
+   *
+   * <p>This method should only be used when the store was created with useExternalWatch=true.
+   *
+   * @param node The deserialized node for PUT events, or null for DELETE events
+   */
+  void updateCacheFromExternalWatch(T node) {
+    if (!shouldCache) {
+      LOG.warn(
+          "updateCacheFromExternalWatch called but caching is disabled for store: {}", storeFolder);
+      return;
+    }
+
+    if (!useExternalWatch) {
+      LOG.warn(
+          "updateCacheFromExternalWatch called but store {} is not in external watch mode",
+          storeFolder);
+    }
+
+    if (node != null) {
+      // PUT event - update cache
+      cache.put(node.getName(), node);
+      LOG.trace(
+          "External watch updated cache for node: {} in store: {}", node.getName(), storeFolder);
+    }
+  }
+
+  /**
+   * Removes a node from the cache based on an external watch DELETE event.
+   *
+   * @param nodeName The name of the node to remove
+   * @return The removed node, or null if it wasn't in the cache
+   */
+  T removeCacheFromExternalWatch(String nodeName) {
+    if (!shouldCache) {
+      LOG.warn(
+          "removeCacheFromExternalWatch called but caching is disabled for store: {}", storeFolder);
+      return null;
+    }
+
+    T removed = cache.remove(nodeName);
+    if (removed != null) {
+      LOG.trace("External watch removed node: {} from cache in store: {}", nodeName, storeFolder);
+    }
+    return removed;
   }
 
   /**

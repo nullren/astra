@@ -66,6 +66,12 @@ public class EtcdPartitioningMetadataStore<T extends AstraPartitionedMetadata>
       new ConcurrentHashMap<>();
 
   /**
+   * When true, partition stores use external watch mode (no per-partition watches). This reduces
+   * etcd connections by ~500x but requires this store to route events.
+   */
+  private final boolean useConsolidatedWatches;
+
+  /**
    * Constructor for EtcdPartitioningMetadataStore with default empty partition filters.
    *
    * @param etcdClient the etcd client
@@ -112,11 +118,22 @@ public class EtcdPartitioningMetadataStore<T extends AstraPartitionedMetadata>
     this.partitionFilters = partitionFilters;
     this.etcdConfig = etcdConfig;
     this.meterRegistry = meterRegistry;
+    this.useConsolidatedWatches = etcdConfig.getUseConsolidatedWatches();
     this.executorService =
         Executors.newSingleThreadExecutor(
             new ThreadFactoryBuilder()
                 .setNameFormat("etcd-watcher-" + storeFolder + "-%d")
                 .build());
+
+    if (useConsolidatedWatches) {
+      LOG.info(
+          "Consolidated watches ENABLED for store {} - partition stores will not create individual watches",
+          storeFolder);
+    } else {
+      LOG.info(
+          "Consolidated watches DISABLED for store {} - using legacy per-partition watches",
+          storeFolder);
+    }
 
     Watch.Listener watcher = buildWatcher();
 
@@ -269,16 +286,72 @@ public class EtcdPartitioningMetadataStore<T extends AstraPartitionedMetadata>
                       continue;
                     }
 
-                    // Handle PUT events - create metadata store if needed
+                    // Extract item path within the partition (if this is an item, not just
+                    // partition root)
+                    String itemPath = slashIdx > 0 ? remaining.substring(slashIdx + 1) : null;
+
+                    // Handle PUT events - create metadata store if needed and route to cache
                     if (event.getEventType() == WatchEvent.EventType.PUT) {
                       LOG.debug(
-                          "PUT event detected, creating/updating metadata store for partition: {}",
-                          partition);
-                      getOrCreateMetadataStore(partition);
+                          "PUT event detected for partition: {}, item: {}", partition, itemPath);
+                      EtcdMetadataStore<T> store = getOrCreateMetadataStore(partition);
+
+                      // When consolidated watches are enabled, route events to partition caches
+                      // from this single watcher. When disabled, partition stores have their own
+                      // watches and handle cache updates themselves.
+                      if (useConsolidatedWatches && itemPath != null && !itemPath.isEmpty()) {
+                        try {
+                          String json =
+                              event.getKeyValue().getValue().toString(StandardCharsets.UTF_8);
+                          T node = serializer.fromJsonStr(json);
+                          store.updateCacheFromExternalWatch(node);
+
+                          // Notify any registered listeners
+                          listenerMap.forEach(
+                              (_, listener) -> {
+                                try {
+                                  listener.onMetadataStoreChanged(node);
+                                } catch (Exception e) {
+                                  LOG.error(
+                                      "Error notifying listener for node: {}", node.getName(), e);
+                                }
+                              });
+                        } catch (Exception e) {
+                          LOG.error(
+                              "Failed to deserialize/cache node from watch event for key: {}",
+                              keyStr,
+                              e);
+                        }
+                      }
                     }
-                    // Handle DELETE events
+                    // Handle DELETE events - update cache and check for partition deletion
                     else if (event.getEventType() == WatchEvent.EventType.DELETE) {
                       LOG.debug("DELETE event detected for key: {}", keyStr);
+
+                      // When consolidated watches are enabled, route delete events to partition
+                      // caches. When disabled, partition stores handle their own cache updates.
+                      if (useConsolidatedWatches && itemPath != null && !itemPath.isEmpty()) {
+                        EtcdMetadataStore<T> store = metadataStoreMap.get(partition);
+                        if (store != null) {
+                          T removedNode = store.removeCacheFromExternalWatch(itemPath);
+                          // Notify listeners if we had the node cached
+                          if (removedNode != null) {
+                            listenerMap.forEach(
+                                (_, listener) -> {
+                                  try {
+                                    listener.onMetadataStoreChanged(removedNode);
+                                  } catch (Exception e) {
+                                    LOG.error(
+                                        "Error notifying listener for deleted node: {}",
+                                        removedNode.getName(),
+                                        e);
+                                  }
+                                });
+                          }
+                        }
+                      }
+
+                      // Check if the partition itself should be cleaned up
                       handlePartitionDeletion(partition);
                     }
                   } else {
@@ -588,11 +661,26 @@ public class EtcdPartitioningMetadataStore<T extends AstraPartitionedMetadata>
         (p1) -> {
           String path = String.format("%s/%s", storeFolder, p1);
           LOG.debug(
-              "Creating new etcd metadata store for partition - {}, at path - {}", partition, path);
+              "Creating new etcd metadata store for partition - {}, at path - {}, useExternalWatch={}",
+              partition,
+              path,
+              useConsolidatedWatches);
 
+          // When useConsolidatedWatches is enabled, partition stores use external watch mode
+          // (useExternalWatch=true) so they don't create their own watches. This partitioning
+          // store's single top-level watcher will route events to the appropriate partition's
+          // cache, reducing etcd watch connections by ~500x.
+          // When disabled (legacy mode), each partition store creates its own watch.
           EtcdMetadataStore<T> newStore =
               new EtcdMetadataStore<>(
-                  path, etcdConfig, true, meterRegistry, serializer, createMode, etcdClient);
+                  path,
+                  etcdConfig,
+                  true,
+                  meterRegistry,
+                  serializer,
+                  createMode,
+                  etcdClient,
+                  useConsolidatedWatches);
           listenerMap.forEach((_, listener) -> newStore.addListener(listener));
 
           return newStore;
